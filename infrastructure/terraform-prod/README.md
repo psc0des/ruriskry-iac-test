@@ -1,0 +1,195 @@
+# Mini Production Environment — Terraform
+
+This folder creates a **real Azure environment** that RuriSkry governs in live demos.
+Every resource here has a specific role in the governance story.
+
+---
+
+## What Gets Deployed and Why
+
+| Resource | Type | Purpose | Expected Verdict |
+|---|---|---|---|
+| `vm-dr-01` | Linux VM (`var.vm_size`) | Idle disaster-recovery standby | **DENIED** (DR policy + high blast radius) |
+| `vm-web-01` | Linux VM (`var.vm_size`) | Active web server — cloud-init installs CPU stress cron | **APPROVED** (safe scale-up, no policy violations) |
+| `payment-api-prod-<suffix>` | App Service F1 (free) | Payment microservice | Critical dependency (raises blast radius of vm-web-01 actions) |
+| `nsg-east-prod` | Network Security Group | Subnet gateway for both VMs | **ESCALATED** (opening port 8080 affects all governed workloads) |
+| `ruriskryprod<suffix>` | Storage Account LRS | Shared dependency for all three | Deletion would cascade to all three resources |
+| Auto-shutdown | Dev/Test Schedule | Shutdown VMs at 22:00 UTC | Saves money while not demoing |
+| CPU alert | Monitor Metric Alert | Fires when vm-web-01 CPU > 80% | Triggers monitoring agent → scale-up proposal |
+| Heartbeat alert | Scheduled Query Alert | Fires when vm-dr-01 goes silent | Triggers cost agent → deletion proposal |
+| AMA + DCR | VM Extension + Data Collection Rule | Routes heartbeat + perf data to Log Analytics | Enables real alert telemetry (not just "no data") |
+
+---
+
+## Governance Demo Scenarios
+
+### Scenario 1 — DENIED: Cost Agent Tries to Delete vm-dr-01
+
+```
+Cost agent: "vm-dr-01 has been idle for 30+ days. Proposing deletion. Savings: $15/month."
+RuriSkry evaluates:
+  SRI:Policy      = 90  ← disaster-recovery=true tag → protected resource violation
+  SRI:Blast Radius= 75  ← dr-failover-service and backup-coordinator depend on it
+  SRI:Historical  = 80  ← similar DR deletions caused 2h outages
+  SRI:Cost        = 10  ← saving money is good, but not at this risk
+  SRI Composite   = 78  ← DENIED (threshold: >60)
+```
+
+### Scenario 2 — APPROVED: SRE Agent Scales Up vm-web-01
+
+```
+Monitoring agent: "vm-web-01 CPU at 87% for 15 minutes. Proposing scale-up to Standard_B2ms."
+RuriSkry evaluates:
+  SRI:Policy      = 10  ← no policy violations (not a protected resource)
+  SRI:Blast Radius= 15  ← vm-web-01 has no critical downstream services
+  SRI:Historical  = 5   ← web VM scaling has zero incident history
+  SRI:Cost        = 20  ← slight cost increase, acceptable for availability
+  SRI Composite   = 12  ← APPROVED (threshold: ≤25)
+```
+
+### Scenario 3 — ESCALATED: Deploy Agent Opens Port 8080 on nsg-east-prod
+
+```
+Deploy agent: "Opening port 8080 on nsg-east-prod for new microservice."
+RuriSkry evaluates:
+  SRI:Policy      = 55  ← NSG changes need human review (managed-by=platform-team)
+  SRI:Blast Radius= 60  ← nsg-east-prod governs both vm-dr-01 and vm-web-01
+  SRI:Historical  = 40  ← similar NSG changes caused brief connectivity issues
+  SRI:Cost        = 5   ← no cost impact
+  SRI Composite   = 43  ← ESCALATED (threshold: 26-60, human review required)
+```
+
+---
+
+## Prerequisites
+
+- Terraform 1.5+
+- Azure CLI — run `az login` first
+- Azure subscription with quota for 2× `Standard_B2ls_v2` VMs (default `var.vm_size`) and 1× App Service F1
+- About $5–10 of Azure credits (VMs auto-shutdown nightly; App Service F1 is free)
+- Region with B2ls_v2 availability — default is `canadacentral`
+
+---
+
+## Deploy
+
+```bash
+# 1. Go to this folder
+cd infrastructure/terraform-prod
+
+# 2. Copy and fill in your variables
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your subscription ID, suffix, password, email
+# NSG source IP is auto-detected by default (api.ipify.org) and applied as /32.
+# Optional: set allowed_source_cidr_override to pin a fixed CIDR.
+
+# 3. Initialize Terraform (downloads the Azure provider)
+terraform init
+
+# 4. Preview what will be created
+terraform plan
+
+# 5. Create the resources (takes ~5 minutes)
+terraform apply
+
+# 6. Copy real resource IDs into seed_resources.json
+terraform output seed_resources_ids
+
+# Optional: verify what IP rules were applied to NSG and Storage
+terraform output nsg_allowed_source_cidr   # e.g. 1.2.3.4/32 (NSG accepts /32)
+terraform output storage_allowed_ip        # e.g. 1.2.3.4   (Storage rejects /32)
+```
+
+---
+
+## After Deployment — Update seed_resources.json
+
+After `terraform apply`, run:
+
+```bash
+terraform output seed_resources_ids
+```
+
+Copy the real Azure resource IDs into `data/seed_resources.json`. This makes RuriSkry's
+mock Azure Resource Graph point to the actual resources, so the dashboard shows real IDs.
+
+---
+
+## Destroy (When You're Done)
+
+```bash
+# From infrastructure/terraform-prod/
+terraform destroy
+```
+
+This removes all resources and stops all charges. Always run this after the demo.
+
+---
+
+## Cost Estimate
+
+| Resource | Cost while running | With auto-shutdown (8h/day) |
+|---|---|---|
+| vm-dr-01 (B2ls_v2) | ~$0.0499/hour | ~$0.40/day |
+| vm-web-01 (B2ls_v2) | ~$0.0499/hour | ~$0.40/day |
+| App Service F1 | FREE | FREE |
+| Storage LRS 1GB | ~$0.002/day | ~$0.002/day |
+| Log Analytics | pay-per-GB | minimal for demo |
+| **Total** | — | **~$0.80/day** |
+
+> Prices are for `canadacentral`. If you override `var.vm_size`, the `terraform output next_steps` will print the actual hourly rate for your chosen SKU.
+
+Auto-shutdown is configured at 22:00 UTC. Remember to start VMs manually before a demo:
+```bash
+az vm start --resource-group ruriskry-prod-rg --name vm-dr-01
+az vm start --resource-group ruriskry-prod-rg --name vm-web-01
+```
+
+---
+
+## File Map
+
+```
+infrastructure/terraform-prod/
+├── main.tf                   ← All resources (VMs, NSG, storage, alerts, App Service)
+├── variables.tf              ← Input variable definitions
+├── outputs.tf                ← Exports all resource IDs, names, tags, URLs
+├── terraform.tfvars.example  ← Template for your terraform.tfvars (gitignored)
+└── README.md                 ← This file
+```
+
+---
+
+## Notes
+
+- **Network access model (hardened for demo):**
+  - NSG allows HTTP/HTTPS from your current public IP (as a `/32` CIDR) and from inside the VNet.
+  - Storage firewall is `Deny` by default; allows your plain public IP and the prod subnet via service endpoint.
+  - NSG and Storage use *different* representations of the same IP — NSG uses `1.2.3.4/32` (CIDR
+    notation is valid in NSG rules), Storage uses `1.2.3.4` (plain IP — Azure Storage rejects `/31`
+    and `/32` CIDRs in `ip_rules`). This split is handled automatically by `local.allowed_source_cidr`
+    (NSG) vs `local.storage_allowed_ip` (Storage) in `main.tf`.
+  - To pin a fixed IP/CIDR (instead of auto-detected IP), set `allowed_source_cidr_override` in
+    `terraform.tfvars`. If you enter a `/32`, Terraform strips it to a plain IP for Storage automatically.
+
+- **Heartbeat alerts** use a real pipeline: AMA (Azure Monitor Agent) is installed on both VMs
+  via `azurerm_virtual_machine_extension`, and a Data Collection Rule (DCR) routes heartbeat +
+  CPU perf data to the Log Analytics workspace. No manual setup required after `terraform apply`.
+
+- **CPU stress (vm-web-01 only):** A cloud-init script runs on first boot. It installs `stress-ng`
+  and adds a cron job (`*/30 * * * *`) that pegs all CPUs for 20 minutes every 30 minutes.
+  This ensures the CPU alert fires naturally during a demo without any manual intervention.
+  To verify or stop the cron: `az vm run-command invoke --resource-group ruriskry-prod-rg
+  --name vm-web-01 --command-id RunShellScript --scripts "cat /etc/crontab"`
+
+- **No Azure Bastion** — SSH access is not needed for these demo VMs. They are governance targets,
+  not interactive boxes. Use `az vm run-command invoke` for any one-off commands.
+
+- **App Service name** includes your suffix (`payment-api-prod-<suffix>`) because
+  App Service names must be globally unique across all Azure customers.
+  In `seed_resources.json` we refer to it as `payment-api-prod` for readability.
+
+- **Storage account name** similarly includes your suffix (`ruriskryprod<suffix>`).
+
+- All resources use **Standard_LRS** or **Free tier** — no zone redundancy, no SLA.
+  This is intentional: this is a demo environment, not production-grade.
