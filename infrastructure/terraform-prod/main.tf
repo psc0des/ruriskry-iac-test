@@ -277,6 +277,10 @@ resource "azurerm_linux_virtual_machine" "dr01" {
   admin_password                  = var.vm_admin_password
   disable_password_authentication = false
 
+  identity {
+    type = "SystemAssigned"
+  }
+
   network_interface_ids = [azurerm_network_interface.dr01.id]
 
   os_disk {
@@ -320,6 +324,10 @@ resource "azurerm_linux_virtual_machine" "web01" {
   admin_username                  = var.vm_admin_username
   admin_password                  = var.vm_admin_password
   disable_password_authentication = false
+
+  identity {
+    type = "SystemAssigned"
+  }
 
   # Cloud-init script: runs once on first boot after terraform apply.
   # Installs stress-ng and adds a cron job that spikes CPU every 30 minutes
@@ -500,6 +508,18 @@ resource "azurerm_monitor_data_collection_rule_association" "web01" {
   name                    = "dcra-vm-web-01"
   target_resource_id      = azurerm_linux_virtual_machine.web01.id
   data_collection_rule_id = azurerm_monitor_data_collection_rule.vm_signals.id
+}
+
+resource "azurerm_role_assignment" "ama_dr01" {
+  scope                = azurerm_resource_group.prod.id
+  role_definition_name = "Monitoring Metrics Publisher"
+  principal_id         = azurerm_linux_virtual_machine.dr01.identity[0].principal_id
+}
+
+resource "azurerm_role_assignment" "ama_web01" {
+  scope                = azurerm_resource_group.prod.id
+  role_definition_name = "Monitoring Metrics Publisher"
+  principal_id         = azurerm_linux_virtual_machine.web01.identity[0].principal_id
 }
 
 # =============================================================================
