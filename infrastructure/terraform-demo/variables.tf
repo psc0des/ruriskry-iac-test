@@ -65,6 +65,17 @@ variable "alert_email" {
   default     = "ops-team@example.com"
 }
 
+variable "alert_webhook_url" {
+  description = <<-EOT
+    Full URL of the RuriSkry /api/alert-trigger endpoint.
+    Azure Monitor POSTs alert payloads here so the monitoring agent is triggered automatically.
+    Example: "https://your-api-host/api/alert-trigger"
+    Leave empty to disable webhook forwarding (alerts will email only).
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "allowed_source_cidr_override" {
   description = "Optional CIDR override for NSG HTTP/HTTPS allow rules (example: 203.0.113.10/32). If empty, Terraform auto-detects your current public IP."
   type        = string
@@ -89,11 +100,11 @@ variable "allowed_source_cidr_override" {
 variable "iac_github_repo" {
   description = "GitHub repo that owns this Terraform config (owner/repo). Written as iac_repo tag on all resources. Used by RuriSkry ExecutionGateway to create PRs."
   type        = string
-  default     = "psc0des/ruriskry"
+  default     = "your-org/ruriskry"
 }
 
 variable "iac_terraform_path" {
   description = "Path within iac_github_repo to this Terraform directory. Written as iac_path tag on all resources."
   type        = string
-  default     = "infrastructure/terraform-prod"
+  default     = "infrastructure/terraform-demo"
 }

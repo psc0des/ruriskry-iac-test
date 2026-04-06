@@ -17,6 +17,10 @@
 terraform {
   required_version = ">= 1.5.0"
 
+  # Local state — intentional. This is a throwaway demo environment.
+  # State is stored in terraform.tfstate on your local machine (gitignored).
+  # No remote backend needed.
+
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
@@ -277,6 +281,8 @@ resource "azurerm_linux_virtual_machine" "dr01" {
   admin_password                  = var.vm_admin_password
   disable_password_authentication = false
 
+  # System-assigned MI required by AMA to authenticate to Log Analytics.
+  # Without this, AMA cannot send heartbeats or metrics — alert fires forever.
   identity {
     type = "SystemAssigned"
   }
@@ -325,6 +331,7 @@ resource "azurerm_linux_virtual_machine" "web01" {
   admin_password                  = var.vm_admin_password
   disable_password_authentication = false
 
+  # System-assigned MI required by AMA — same reason as dr01.
   identity {
     type = "SystemAssigned"
   }
@@ -359,6 +366,7 @@ resource "azurerm_linux_virtual_machine" "web01" {
 
   tags = merge(local.common_tags, {
     tier        = "web"
+    criticality = "critical"
     environment = "production"
     owner       = "web-team"
     cost-center = "frontend"
@@ -510,6 +518,14 @@ resource "azurerm_monitor_data_collection_rule_association" "web01" {
   data_collection_rule_id = azurerm_monitor_data_collection_rule.vm_signals.id
 }
 
+# =============================================================================
+# AMA Role Assignments — Monitoring Metrics Publisher
+# =============================================================================
+# AMA authenticates to Log Analytics using the VM's System-Assigned MI.
+# Without this role, AMA silently drops all telemetry (heartbeats, perf)
+# even if the extension shows "Provisioning succeeded" in the portal.
+# Scope: resource group (not subscription) — least-privilege.
+
 resource "azurerm_role_assignment" "ama_dr01" {
   scope                = azurerm_resource_group.prod.id
   role_definition_name = "Monitoring Metrics Publisher"
@@ -535,6 +551,20 @@ resource "azurerm_monitor_action_group" "prod" {
   email_receiver {
     name          = "ops-team"
     email_address = var.alert_email
+  }
+
+  # Wire Azure Monitor alerts into the RuriSkry governance engine.
+  # When an alert fires (CPU spike, heartbeat loss), Azure POSTs the payload
+  # to /api/alert-trigger, which triggers the monitoring agent to propose an
+  # action (scale-up or idle-resource deletion) for governance evaluation.
+  # Set alert_webhook_url in terraform.tfvars to enable this flow.
+  dynamic "webhook_receiver" {
+    for_each = var.alert_webhook_url != "" ? [1] : []
+    content {
+      name                    = "ruriskry-alert-trigger"
+      service_uri             = var.alert_webhook_url
+      use_common_alert_schema = false
+    }
   }
 }
 
@@ -617,4 +647,83 @@ resource "azurerm_monitor_scheduled_query_rules_alert_v2" "dr01_heartbeat" {
     azurerm_virtual_machine_extension.ama_dr01,
     azurerm_monitor_data_collection_rule_association.dr01
   ]
+}
+
+# =============================================================================
+# 15. Heartbeat Alert on vm-web-01 (down / deallocated VM detection)
+# =============================================================================
+# Fires when vm-web-01 sends no heartbeat for 15 minutes — indicating the VM
+# has been deallocated or has lost connectivity.
+# In the demo flow: no heartbeat → monitoring agent detects stopped web server
+# → proposes restart_service → RuriSkry evaluates → APPROVES (web tier must run).
+# NOTE: The CPU alert (section 13) cannot detect a deallocated VM because a
+# stopped VM emits no metrics. A heartbeat query fires on *silence* — correct
+# for down-VM detection.
+
+resource "azurerm_monitor_scheduled_query_rules_alert_v2" "web01_heartbeat" {
+  name                = "alert-vm-web-01-heartbeat"
+  resource_group_name = azurerm_resource_group.prod.name
+  location            = azurerm_resource_group.prod.location
+  description         = "Detects when vm-web-01 stops sending heartbeats — stopped or deallocated VM"
+  severity            = 1
+  enabled             = true
+
+  evaluation_frequency = "PT5M"
+  window_duration      = "PT15M"
+  scopes               = [azurerm_log_analytics_workspace.prod.id]
+
+  criteria {
+    # If no heartbeat rows for vm-web-01 in last 15m, alert fires.
+    query = <<-QUERY
+      Heartbeat
+      | where _ResourceId =~ "${azurerm_linux_virtual_machine.web01.id}"
+      | where TimeGenerated > ago(15m)
+    QUERY
+
+    time_aggregation_method = "Count"
+    threshold               = 0
+    operator                = "LessThanOrEqual"
+
+    failing_periods {
+      minimum_failing_periods_to_trigger_alert = 1
+      number_of_evaluation_periods             = 1
+    }
+  }
+
+  action {
+    action_groups = [azurerm_monitor_action_group.prod.id]
+  }
+
+  tags = local.common_tags
+
+  depends_on = [
+    azurerm_virtual_machine_extension.ama_web01,
+    azurerm_monitor_data_collection_rule_association.web01
+  ]
+}
+
+# =============================================================================
+# Azure Activity Log → Log Analytics Diagnostic Setting
+#
+# Streams subscription-level activity logs (Administrative, Security, Policy,
+# ServiceHealth, etc.) to the prod Log Analytics workspace so that
+# query_activity_log() can query the AzureActivity KQL table.
+#
+# Without this, query_activity_log() always returns [] in live mode because the
+# AzureActivity table simply doesn't exist in the workspace.
+# =============================================================================
+
+resource "azurerm_monitor_diagnostic_setting" "activity_logs" {
+  name                       = "activity-logs-to-law-${var.suffix}"
+  target_resource_id         = "/subscriptions/${var.subscription_id}"
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.prod.id
+
+  enabled_log { category = "Administrative" }
+  enabled_log { category = "Security" }
+  enabled_log { category = "ServiceHealth" }
+  enabled_log { category = "Alert" }
+  enabled_log { category = "Recommendation" }
+  enabled_log { category = "Policy" }
+  enabled_log { category = "Autoscale" }
+  enabled_log { category = "ResourceHealth" }
 }
